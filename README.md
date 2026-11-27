@@ -1,6 +1,6 @@
 <div align="center">
   <img src="assets/banner.png" alt="Echo Music Logo"/>
-
+--i am cvr
   <p><b>A modern Android music app with ad-free streaming, synced lyrics, offline playback, and an intuitive user experience.</b></p>
 </div>
 
