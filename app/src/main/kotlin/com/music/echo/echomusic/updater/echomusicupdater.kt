@@ -363,28 +363,47 @@ fun UpdateScreen(navController: NavHostController) {
                         return@AnimatedActionButton
                       }
                       file.let { f ->
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                          if (!context.packageManager.canRequestPackageInstalls()) {
-                            val intent =
-                              Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
-                                .apply { data = Uri.parse("package:${context.packageName}") }
-                            context.startActivity(intent)
-                            return@let
+                        try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            if (!context.packageManager.canRequestPackageInstalls()) {
+                              val intent =
+                                Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                                  .apply {
+                                    data = Uri.parse("package:${context.packageName}")
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                  }
+                              context.startActivity(intent)
+                              return@let
+                            }
+                          }
+                          val uri =
+                            FileProvider.getUriForFile(
+                              context,
+                              "${context.packageName}.FileProvider",
+                              f,
+                            )
+                          val installIntent =
+                            Intent(Intent.ACTION_VIEW).apply {
+                              setDataAndType(uri, "application/vnd.android.package-archive")
+                              addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                          ContextCompat.startActivity(context, installIntent, null)
+                        } catch (e: SecurityException) {
+                          Log.w(
+                            "UpdateInstall",
+                            "Install permission not declared in this build; opening release download",
+                            e,
+                          )
+                          context.safeOpenUri(currentStatus.apkUrl ?: GITHUB_RELEASES_URL)
+                        } catch (e: Exception) {
+                          Log.e("UpdateInstall", "Failed to launch APK installer", e)
+                          scope.launch {
+                            snackbarHostState.showSnackbar(
+                              context.getString(R.string.download_failed),
+                            )
                           }
                         }
-                        val uri =
-                          FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.FileProvider",
-                            file,
-                          )
-                        val installIntent =
-                          Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, "application/vnd.android.package-archive")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                          }
-                        ContextCompat.startActivity(context, installIntent, null)
                       }
                     } else {
                       val urlToDownload = currentStatus.apkUrl
