@@ -13,6 +13,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import echo.music.iad1tya.R
+import echo.music.iad1tya.echomusic.updater.GITHUB_RELEASES_URL
 
 object UpdateNotificationHelper {
   private const val CHANNEL_ID = "updates"
@@ -31,7 +32,7 @@ object UpdateNotificationHelper {
       nm.createNotificationChannel(channel)
     }
 
-    val apkUrl = "https://echomusic.fun"
+    val apkUrl = GITHUB_RELEASES_URL
     val intent = Intent(Intent.ACTION_VIEW, apkUrl.toUri())
 
     val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE

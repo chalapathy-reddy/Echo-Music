@@ -2,22 +2,37 @@ package echo.music.iad1tya.echomusic.component
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Observer
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import echo.music.iad1tya.R
 import echo.music.iad1tya.echomusic.updater.ChangelogSection
+import echo.music.iad1tya.echomusic.updater.GITHUB_RELEASES_URL
+import echo.music.iad1tya.echomusic.updater.enqueueApkUpdateDownload
+import echo.music.iad1tya.echomusic.updater.installDownloadedApk
+import echo.music.iad1tya.echomusic.updater.latestCachedUpdateAsset
 import echo.music.iad1tya.ui.utils.parseMarkdownToSections
 import echo.music.iad1tya.ui.utils.parseSimpleMarkdown
 import echo.music.iad1tya.ui.utils.safeOpenUri
+import java.io.File
 import racra.compose.smooth_corner_rect_library.AbsoluteSmoothCornerShape
 
 /**
@@ -37,6 +52,61 @@ fun UpdateAvailableDialog(
   onDismiss: () -> Unit,
 ) {
   val context = LocalContext.current
+  var isDownloading by remember { mutableStateOf(false) }
+  var downloadProgress by remember { mutableStateOf(0f) }
+  var isDownloadComplete by remember { mutableStateOf(false) }
+  var downloadedFile by remember { mutableStateOf<File?>(null) }
+  var downloadError by remember { mutableStateOf<String?>(null) }
+
+  val cachedAsset =
+    remember(version, latestCachedUpdateAsset) {
+      latestCachedUpdateAsset?.takeIf { it.version == version } ?: latestCachedUpdateAsset
+    }
+
+  DisposableEffect(version) {
+    val liveData =
+      WorkManager.getInstance(context).getWorkInfosForUniqueWorkLiveData("update_download")
+    val observer =
+      Observer<List<WorkInfo>> { workInfos ->
+        val workInfo = workInfos.firstOrNull() ?: return@Observer
+        if (!workInfo.tags.contains("version:$version")) return@Observer
+        when (workInfo.state) {
+          WorkInfo.State.RUNNING -> {
+            isDownloading = true
+            downloadError = null
+            downloadProgress = workInfo.progress.getFloat("progress", 0f)
+          }
+          WorkInfo.State.SUCCEEDED -> {
+            isDownloading = false
+            isDownloadComplete = true
+            downloadError = null
+            val filePath = workInfo.outputData.getString("file_path")
+            if (filePath != null) {
+              downloadedFile = File(filePath)
+            }
+          }
+          WorkInfo.State.FAILED -> {
+            isDownloading = false
+            downloadError = context.getString(R.string.download_failed)
+          }
+          WorkInfo.State.CANCELLED -> {
+            isDownloading = false
+            downloadProgress = 0f
+          }
+          else -> {}
+        }
+      }
+    liveData.observeForever(observer)
+    onDispose { liveData.removeObserver(observer) }
+  }
+
+  LaunchedEffect(isDownloadComplete, downloadedFile) {
+    if (isDownloadComplete && downloadedFile != null && !downloadedFile!!.exists()) {
+      isDownloadComplete = false
+      downloadedFile = null
+      downloadProgress = 0f
+    }
+  }
   val cardShape =
     AbsoluteSmoothCornerShape(
       cornerRadiusTL = 30.dp,
@@ -181,6 +251,31 @@ fun UpdateAvailableDialog(
           }
         }
 
+        if (isDownloading) {
+          if (downloadProgress > 0f) {
+            LinearProgressIndicator(
+              progress = downloadProgress,
+              modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+              color = MaterialTheme.colorScheme.primary,
+              trackColor = MaterialTheme.colorScheme.surfaceContainer,
+            )
+          } else {
+            LinearProgressIndicator(
+              modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+              color = MaterialTheme.colorScheme.primary,
+              trackColor = MaterialTheme.colorScheme.surfaceContainer,
+            )
+          }
+        }
+
+        downloadError?.let { errorMessage ->
+          Text(
+            text = errorMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+          )
+        }
+
         Row(
           modifier = Modifier.fillMaxWidth(),
           verticalAlignment = Alignment.CenterVertically,
@@ -190,17 +285,51 @@ fun UpdateAvailableDialog(
             onClick = onDismiss,
             shape = actionShape,
           ) {
-            Text(text = "Next time")
+            Text(text = if (isDownloading) "Hide" else "Next time")
           }
           Spacer(modifier = Modifier.width(8.dp))
           Button(
             onClick = {
-              onDismiss()
-              context.safeOpenUri("https://echomusic.fun")
+              if (isDownloadComplete) {
+                val file = downloadedFile
+                if (file == null || !file.exists()) {
+                  isDownloadComplete = false
+                  downloadedFile = null
+                  downloadProgress = 0f
+                  return@Button
+                }
+                installDownloadedApk(
+                  context = context,
+                  file = file,
+                  fallbackUrl = cachedAsset?.apkUrl,
+                  onInstallError = { downloadError = context.getString(R.string.download_failed) },
+                )
+              } else {
+                val urlToDownload = cachedAsset?.apkUrl
+                if (urlToDownload.isNullOrBlank()) {
+                  onDismiss()
+                  context.safeOpenUri(GITHUB_RELEASES_URL)
+                } else {
+                  downloadError = null
+                  enqueueApkUpdateDownload(
+                    context = context,
+                    apkUrl = urlToDownload,
+                    version = version,
+                    fileSize = cachedAsset?.fileSize.orEmpty(),
+                  )
+                  isDownloading = true
+                }
+              }
             },
+            enabled = !isDownloading || isDownloadComplete,
             shape = actionShape,
           ) {
-            Text(text = "Update")
+            Text(
+              text =
+                if (isDownloading) "${(downloadProgress * 100).toInt()}%"
+                else if (isDownloadComplete) stringResource(R.string.install)
+                else "Update",
+            )
           }
         }
       }

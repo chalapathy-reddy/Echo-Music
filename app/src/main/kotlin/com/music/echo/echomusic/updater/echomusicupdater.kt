@@ -145,6 +145,100 @@ fun fetchLatestGitHubRelease(): JSONObject? {
   return firstNonDraft
 }
 
+data class CachedUpdateAsset(
+  val version: String,
+  val apkUrl: String?,
+  val fileSize: String,
+)
+
+@Volatile
+var latestCachedUpdateAsset: CachedUpdateAsset? = null
+  private set
+
+fun enqueueApkUpdateDownload(
+  context: Context,
+  apkUrl: String,
+  version: String,
+  fileSize: String,
+) {
+  DownloadNotificationManager.initialize(context)
+  val constraints =
+    Constraints.Builder()
+      .setRequiredNetworkType(NetworkType.CONNECTED)
+      .build()
+
+  val downloadRequest =
+    OneTimeWorkRequestBuilder<UpdateDownloadWorker>()
+      .setInputData(
+        workDataOf(
+          "apk_url" to apkUrl,
+          "version" to version,
+          "file_size" to fileSize,
+        ),
+      )
+      .setConstraints(constraints)
+      .setBackoffCriteria(
+        BackoffPolicy.EXPONENTIAL,
+        10,
+        java.util.concurrent.TimeUnit.SECONDS,
+      )
+      .addTag("update_download")
+      .addTag("version:$version")
+      .build()
+
+  WorkManager.getInstance(context)
+    .enqueueUniqueWork(
+      "update_download",
+      ExistingWorkPolicy.REPLACE,
+      downloadRequest,
+    )
+}
+
+fun installDownloadedApk(
+  context: Context,
+  file: File,
+  fallbackUrl: String?,
+  onInstallError: () -> Unit = {},
+) {
+  try {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      if (!context.packageManager.canRequestPackageInstalls()) {
+        val intent =
+          Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+            .apply {
+              data = Uri.parse("package:${context.packageName}")
+              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        context.startActivity(intent)
+        return
+      }
+    }
+    val uri =
+      FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.FileProvider",
+        file,
+      )
+    val installIntent =
+      Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+    ContextCompat.startActivity(context, installIntent, null)
+  } catch (e: SecurityException) {
+    Log.w(
+      "UpdateInstall",
+      "Install permission not declared in this build; opening release download",
+      e,
+    )
+    context.safeOpenUri(fallbackUrl ?: GITHUB_RELEASES_URL)
+  } catch (e: Exception) {
+    Log.e("UpdateInstall", "Failed to launch APK installer", e)
+    onInstallError()
+  }
+}
+
 data class ChangelogSection(val title: String, val items: List<String>)
 
 sealed class EchoUpdateStatus {
@@ -363,81 +457,30 @@ fun UpdateScreen(navController: NavHostController) {
                         return@AnimatedActionButton
                       }
                       file.let { f ->
-                        try {
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            if (!context.packageManager.canRequestPackageInstalls()) {
-                              val intent =
-                                Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
-                                  .apply {
-                                    data = Uri.parse("package:${context.packageName}")
-                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                  }
-                              context.startActivity(intent)
-                              return@let
+                        installDownloadedApk(
+                          context = context,
+                          file = f,
+                          fallbackUrl = currentStatus.apkUrl,
+                          onInstallError = {
+                            scope.launch {
+                              snackbarHostState.showSnackbar(
+                                context.getString(R.string.download_failed),
+                              )
                             }
-                          }
-                          val uri =
-                            FileProvider.getUriForFile(
-                              context,
-                              "${context.packageName}.FileProvider",
-                              f,
-                            )
-                          val installIntent =
-                            Intent(Intent.ACTION_VIEW).apply {
-                              setDataAndType(uri, "application/vnd.android.package-archive")
-                              addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                          ContextCompat.startActivity(context, installIntent, null)
-                        } catch (e: SecurityException) {
-                          Log.w(
-                            "UpdateInstall",
-                            "Install permission not declared in this build; opening release download",
-                            e,
-                          )
-                          context.safeOpenUri(currentStatus.apkUrl ?: GITHUB_RELEASES_URL)
-                        } catch (e: Exception) {
-                          Log.e("UpdateInstall", "Failed to launch APK installer", e)
-                          scope.launch {
-                            snackbarHostState.showSnackbar(
-                              context.getString(R.string.download_failed),
-                            )
-                          }
-                        }
+                          },
+                        )
                       }
                     } else {
                       val urlToDownload = currentStatus.apkUrl
                       if (urlToDownload.isNullOrBlank()) {
                         context.safeOpenUri(GITHUB_RELEASES_URL)
                       } else {
-                        val constraints =
-                          Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
-
-                        val downloadRequest =
-                          OneTimeWorkRequestBuilder<UpdateDownloadWorker>()
-                            .setInputData(
-                              workDataOf(
-                                "apk_url" to urlToDownload,
-                                "version" to currentStatus.version,
-                                "file_size" to currentStatus.size,
-                              ),
-                            )
-                            .setConstraints(constraints)
-                            .setBackoffCriteria(
-                              BackoffPolicy.EXPONENTIAL,
-                              10,
-                              java.util.concurrent.TimeUnit.SECONDS,
-                            )
-                            .addTag("update_download")
-                            .build()
-                        WorkManager.getInstance(context)
-                          .enqueueUniqueWork(
-                            "update_download",
-                            ExistingWorkPolicy.REPLACE,
-                            downloadRequest,
-                          )
+                        enqueueApkUpdateDownload(
+                          context = context,
+                          apkUrl = urlToDownload,
+                          version = currentStatus.version,
+                          fileSize = currentStatus.size,
+                        )
                         isDownloading = true
                       }
                     }
@@ -820,6 +863,13 @@ suspend fun checkForUpdate(
           } ?: ""
         val apkDownloadUrl =
           selectedAsset?.optString("browser_download_url")?.takeIf { it.isNotBlank() }
+
+        latestCachedUpdateAsset =
+          CachedUpdateAsset(
+            version = displayTag,
+            apkUrl = apkDownloadUrl,
+            fileSize = apkSizeInMB,
+          )
 
         withContext(Dispatchers.Main) {
           onSuccess(

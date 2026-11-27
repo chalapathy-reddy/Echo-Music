@@ -62,6 +62,8 @@ jobs:
           PROTECTED_FILES=(
             "app/src/main/kotlin/com/music/echo/ui/screens/settings/UpdateSettings.kt"
             "app/src/main/kotlin/com/music/echo/echomusic/updater/echomusicupdater.kt"
+            "app/src/main/kotlin/com/music/echo/echomusic/component/UpdateAvailableDialog.kt"
+            "app/src/main/kotlin/com/music/echo/echomusic/UpdateNotificationHelper.kt"
             ".github/workflows/sync-upstream-and-build.yml"
           )
 
@@ -164,7 +166,7 @@ jobs:
             echo "### Upstream Sync Completed"
             echo "- **Synced upstream commit:** \`${UPSTREAM_SHORT_SHA}\`"
             echo "- **Upstream commits merged:** ${COMMIT_COUNT}"
-            echo "- **Protected files preserved:** \`UpdateSettings.kt\`, \`echomusicupdater.kt\`"
+            echo "- **Protected files preserved:** \`UpdateSettings.kt\`, \`echomusicupdater.kt\`, \`UpdateAvailableDialog.kt\`, \`UpdateNotificationHelper.kt\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   build-and-release:
@@ -334,7 +336,7 @@ jobs:
             echo "- **Upstream Commit:** [\`${UPSTREAM_SHORT_SHA}\`](https://github.com/EchoMusicApp/Echo-Music/commit/${UPSTREAM_FULL_SHA})"
             echo "- **Upstream Commits Merged:** ${COMMIT_COUNT}"
             echo "- **In-App Update Source:** [\`${FORK_REPO}\`](https://github.com/${FORK_REPO}/releases)"
-            echo "- **Protected Customizations Preserved:** \`UpdateSettings.kt\`, \`echomusicupdater.kt\`"
+            echo "- **Protected Customizations Preserved:** \`UpdateSettings.kt\`, \`echomusicupdater.kt\`, \`UpdateAvailableDialog.kt\`, \`UpdateNotificationHelper.kt\`"
             echo ""
             if [ -n "${CHANGELOG_B64:-}" ]; then
               echo "### Upstream Changes Included"
