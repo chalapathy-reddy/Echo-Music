@@ -41,6 +41,7 @@ import echo.music.iad1tya.echomusic.updater.getBetaUpdatesSetting
 import echo.music.iad1tya.echomusic.updater.getDownloadedApkCount
 import echo.music.iad1tya.echomusic.updater.getUpdateAvailableState
 import echo.music.iad1tya.echomusic.updater.getUpdateNotificationsSetting
+import echo.music.iad1tya.echomusic.updater.saveUpdateAvailableState
 import echo.music.iad1tya.ui.component.IconButton
 import echo.music.iad1tya.ui.component.Material3SettingsGroup
 import echo.music.iad1tya.ui.component.Material3SettingsItem
@@ -48,7 +49,13 @@ import echo.music.iad1tya.ui.utils.backToMain
 import echo.music.iad1tya.ui.utils.parseMarkdownToSections
 import echo.music.iad1tya.ui.utils.parseSimpleMarkdown
 import echo.music.iad1tya.ui.utils.safeOpenUri
+import java.net.HttpURLConnection
+import java.net.URL
 import org.json.JSONObject
+
+private const val GITHUB_RELEASES_URL = "https://github.com/EchoMusicApp/Echo-Music/releases"
+private const val GITHUB_LATEST_RELEASE_API_URL =
+  "https://api.github.com/repos/EchoMusicApp/Echo-Music/releases/latest"
 
 /**
  * Settings screen for managing app updates, checking for new releases, and displaying the latest
@@ -73,7 +80,8 @@ fun UpdateSettings(
     mutableStateOf(getUpdateNotificationsSetting(context))
   }
   var betaUpdatesEnabled by remember { mutableStateOf(getBetaUpdatesSetting(context)) }
-  val isUpdateAvailable = getUpdateAvailableState(context) && autoUpdateEnabled
+  var isUpdateAvailable by remember { mutableStateOf(getUpdateAvailableState(context)) }
+  var latestVersion by remember { mutableStateOf<String?>(null) }
   var apkCount by remember { mutableStateOf(getDownloadedApkCount(context)) }
   var showInfoDialog by remember { mutableStateOf(false) }
   var releaseNotes by remember { mutableStateOf<String?>(null) }
@@ -84,11 +92,31 @@ fun UpdateSettings(
 
     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
       try {
-        val url =
-          java.net.URL("https://api.github.com/repos/EchoMusicApp/Echo-Music/releases/latest")
-        val json = url.openStream().bufferedReader().use { it.readText() }
+        val connection =
+          (URL(GITHUB_LATEST_RELEASE_API_URL).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 15_000
+            setRequestProperty("Accept", "application/vnd.github+json")
+            setRequestProperty("User-Agent", "Echo-Music")
+          }
+        val json =
+          try {
+            connection.inputStream.bufferedReader().use { it.readText() }
+          } finally {
+            connection.disconnect()
+          }
         val targetRelease = JSONObject(json)
-        releaseNotes = targetRelease.getString("body")
+        val tagName = targetRelease.optString("tag_name").trim()
+        if (tagName.isNotEmpty()) {
+          val currentClean = BuildConfig.VERSION_NAME.removePrefix("b").removePrefix("v").trim()
+          val targetClean = tagName.removePrefix("b").removePrefix("v").trim()
+          val hasUpdate = currentClean != targetClean
+          latestVersion = tagName
+          isUpdateAvailable = hasUpdate
+          saveUpdateAvailableState(context, hasUpdate)
+        }
+        releaseNotes = targetRelease.optString("body").takeIf { it.isNotBlank() }
       } catch (e: Exception) {
         e.printStackTrace()
       }
@@ -126,15 +154,25 @@ fun UpdateSettings(
             description = {
               if (isUpdateAvailable) {
                 Text(
-                  text = "New update is available",
-                  color = androidx.compose.ui.graphics.Color.Red,
+                  text =
+                    latestVersion?.let { "New update available ($it)" }
+                      ?: "New update is available",
+                  color = MaterialTheme.colorScheme.error,
                 )
               } else {
                 Text(stringResource(R.string.version, BuildConfig.VERSION_NAME))
               }
             },
             onClick = {
-              context.safeOpenUri("https://echomusic.fun")
+              navController.navigate("update")
+            },
+          ),
+          Material3SettingsItem(
+            icon = painterResource(R.drawable.download),
+            title = { Text("GitHub Releases") },
+            description = { Text(GITHUB_RELEASES_URL) },
+            onClick = {
+              context.safeOpenUri(GITHUB_RELEASES_URL)
             },
           ),
         ),
@@ -142,7 +180,7 @@ fun UpdateSettings(
 
     Text(
       text =
-        "To download updates, you will be redirected to our official site containing ads. This helps fund the app's development. Thank you for your support!",
+        "Updates are downloaded directly from GitHub Releases ($GITHUB_RELEASES_URL).",
       style = MaterialTheme.typography.bodySmall,
       color = MaterialTheme.colorScheme.onSurfaceVariant,
       modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp),

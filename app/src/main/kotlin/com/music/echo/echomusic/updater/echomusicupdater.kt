@@ -39,12 +39,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Observer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -91,6 +93,7 @@ import echo.music.iad1tya.ui.utils.parseMarkdownToSections
 import echo.music.iad1tya.ui.utils.parseSimpleMarkdown
 import echo.music.iad1tya.ui.utils.safeOpenUri
 import java.io.File
+import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
@@ -101,6 +104,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+
+private const val GITHUB_RELEASES_URL = "https://github.com/EchoMusicApp/Echo-Music/releases"
 
 data class ChangelogSection(val title: String, val items: List<String>)
 
@@ -143,11 +148,12 @@ fun UpdateScreen(navController: NavHostController) {
 
   LaunchedEffect(Unit) { DownloadNotificationManager.initialize(context) }
 
-  LaunchedEffect(Unit) {
-    WorkManager.getInstance(context)
-      .getWorkInfosForUniqueWorkLiveData("update_download")
-      .observeForever { workInfos ->
-        val workInfo = workInfos?.firstOrNull() ?: return@observeForever
+  DisposableEffect(Unit) {
+    val liveData =
+      WorkManager.getInstance(context).getWorkInfosForUniqueWorkLiveData("update_download")
+    val observer =
+      Observer<List<WorkInfo>> { workInfos ->
+        val workInfo = workInfos.firstOrNull() ?: return@Observer
 
         when (workInfo.state) {
           WorkInfo.State.RUNNING -> {
@@ -175,6 +181,8 @@ fun UpdateScreen(navController: NavHostController) {
           else -> {}
         }
       }
+    liveData.observeForever(observer)
+    onDispose { liveData.removeObserver(observer) }
   }
 
   LaunchedEffect(isDownloadComplete, downloadedFile) {
@@ -222,9 +230,7 @@ fun UpdateScreen(navController: NavHostController) {
   }
 
   LaunchedEffect(Unit) {
-    if (autoUpdateCheckEnabled) {
-      triggerUpdateCheck()
-    }
+    triggerUpdateCheck()
   }
 
   val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
@@ -343,37 +349,40 @@ fun UpdateScreen(navController: NavHostController) {
                         ContextCompat.startActivity(context, installIntent, null)
                       }
                     } else {
-                      val urlToDownload =
-                        currentStatus.apkUrl
-                          ?: "https://github.com/EchoMusicApp/Echo-Music/releases/download/${currentStatus.version}/echomusic.apk"
+                      val urlToDownload = currentStatus.apkUrl
+                      if (urlToDownload.isNullOrBlank()) {
+                        context.safeOpenUri(GITHUB_RELEASES_URL)
+                      } else {
+                        val constraints =
+                          Constraints.Builder()
+                            .setRequiredNetworkType(NetworkType.CONNECTED)
+                            .build()
 
-                      val constraints =
-                        Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
-
-                      val downloadRequest =
-                        OneTimeWorkRequestBuilder<UpdateDownloadWorker>()
-                          .setInputData(
-                            workDataOf(
-                              "apk_url" to urlToDownload,
-                              "version" to currentStatus.version,
-                              "file_size" to currentStatus.size,
-                            ),
+                        val downloadRequest =
+                          OneTimeWorkRequestBuilder<UpdateDownloadWorker>()
+                            .setInputData(
+                              workDataOf(
+                                "apk_url" to urlToDownload,
+                                "version" to currentStatus.version,
+                                "file_size" to currentStatus.size,
+                              ),
+                            )
+                            .setConstraints(constraints)
+                            .setBackoffCriteria(
+                              BackoffPolicy.EXPONENTIAL,
+                              10,
+                              java.util.concurrent.TimeUnit.SECONDS,
+                            )
+                            .addTag("update_download")
+                            .build()
+                        WorkManager.getInstance(context)
+                          .enqueueUniqueWork(
+                            "update_download",
+                            ExistingWorkPolicy.REPLACE,
+                            downloadRequest,
                           )
-                          .setConstraints(constraints)
-                          .setBackoffCriteria(
-                            BackoffPolicy.EXPONENTIAL,
-                            10,
-                            java.util.concurrent.TimeUnit.SECONDS,
-                          )
-                          .addTag("update_download")
-                          .build()
-                      WorkManager.getInstance(context)
-                        .enqueueUniqueWork(
-                          "update_download",
-                          ExistingWorkPolicy.REPLACE,
-                          downloadRequest,
-                        )
-                      isDownloading = true
+                        isDownloading = true
+                      }
                     }
                   },
                   modifier = Modifier.weight(1f),
@@ -464,11 +473,13 @@ fun UpdateScreen(navController: NavHostController) {
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                   )
-                  Text(
-                    text = stringResource(R.string.update_size_v, currentStatus.size),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                  )
+                  if (currentStatus.size.isNotBlank()) {
+                    Text(
+                      text = stringResource(R.string.update_size_v, currentStatus.size),
+                      style = MaterialTheme.typography.bodyMedium,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                  }
                   Spacer(modifier = Modifier.height(24.dp))
                   if (!currentStatus.imageUrl.isNullOrBlank()) {
                     AsyncImage(
@@ -674,8 +685,10 @@ suspend fun checkForUpdate(
 ) {
   withContext(Dispatchers.IO) {
     try {
-      val url = URL("https://api.github.com/repos/EchoMusicApp/Echo-Music/releases/latest")
-      val json = url.openStream().bufferedReader().use { it.readText() }
+      val json =
+        openTimedStream("https://api.github.com/repos/EchoMusicApp/Echo-Music/releases/latest")
+          .bufferedReader()
+          .use { it.readText() }
       val targetRelease = JSONObject(json)
 
       val currentVersion = BuildConfig.VERSION_NAME
@@ -692,11 +705,12 @@ suspend fun checkForUpdate(
         var description: String? = null
         var imageUrl: String? = null
         try {
-          val changelogUrl =
-            URL(
-              "https://github.com/EchoMusicApp/Echo-Music/releases/download/$tagWithPrefix/changelog.json",
-            )
-          val changelogJson = changelogUrl.openStream().bufferedReader().use { it.readText() }
+          val changelogJson =
+            openTimedStream(
+                "https://github.com/EchoMusicApp/Echo-Music/releases/download/$tagWithPrefix/changelog.json",
+              )
+              .bufferedReader()
+              .use { it.readText() }
           val changelogData = JSONObject(changelogJson)
 
           description = changelogData.optString("description").takeIf { it.isNotEmpty() }
@@ -728,41 +742,31 @@ suspend fun checkForUpdate(
           changelogList.addAll(parsedSections)
         }
 
-        val publishedAt = targetRelease.getString("published_at")
+        val publishedAt = targetRelease.optString("published_at", "")
         val formattedReleaseDate = formatGitHubDate(publishedAt)
-        val assets = targetRelease.getJSONArray("assets")
+        val assets = targetRelease.optJSONArray("assets") ?: JSONArray()
 
-        var apkSizeInMB = ""
-        var apkDownloadUrl = ""
-        for (j in 0 until assets.length()) {
-          val asset = assets.getJSONObject(j)
-          val assetName = asset.getString("name")
-          if (
-            assetName.endsWith(".apk", ignoreCase = true) &&
-              !assetName.lowercase().contains("debug")
-          ) {
-            val apkSizeInBytes = asset.getLong("size")
-            apkSizeInMB = String.format("%.1f", apkSizeInBytes / (1024.0 * 1024.0))
-            apkDownloadUrl = asset.getString("browser_download_url")
-            break
-          }
-        }
+        val selectedAsset = selectBestApkAsset(assets)
+        val apkSizeInMB =
+          selectedAsset?.let {
+            String.format("%.1f", it.optLong("size", 0L) / (1024.0 * 1024.0))
+          } ?: ""
+        val apkDownloadUrl =
+          selectedAsset?.optString("browser_download_url")?.takeIf { it.isNotBlank() }
 
-        if (apkDownloadUrl.isNotEmpty()) {
-          withContext(Dispatchers.Main) {
-            onSuccess(
-              displayTag,
-              true,
-              changelogList,
-              apkSizeInMB,
-              formattedReleaseDate,
-              description,
-              imageUrl,
-              apkDownloadUrl,
-            )
-          }
-          return@withContext
+        withContext(Dispatchers.Main) {
+          onSuccess(
+            displayTag,
+            true,
+            changelogList,
+            apkSizeInMB,
+            formattedReleaseDate,
+            description,
+            imageUrl,
+            apkDownloadUrl,
+          )
         }
+        return@withContext
       }
 
       withContext(Dispatchers.Main) {
@@ -792,17 +796,63 @@ data class WhatsNewInfo(
   val description: String?,
 )
 
+private fun selectBestApkAsset(assets: JSONArray): JSONObject? {
+  val candidates = mutableListOf<JSONObject>()
+  for (j in 0 until assets.length()) {
+    val asset = assets.getJSONObject(j)
+    val assetName = asset.optString("name", "")
+    if (
+      assetName.endsWith(".apk", ignoreCase = true) &&
+        !assetName.lowercase().contains("debug")
+    ) {
+      candidates.add(asset)
+    }
+  }
+  if (candidates.isEmpty()) return null
+
+  val preferredVariant = if (BuildConfig.CAST_AVAILABLE) "gms" else "foss"
+  val variantFiltered =
+    candidates.filter { it.optString("name", "").lowercase().contains(preferredVariant) }
+      .ifEmpty { candidates }
+
+  val primaryAbi = Build.SUPPORTED_ABIS.firstOrNull()?.lowercase().orEmpty()
+  val abiTokens =
+    when {
+      primaryAbi.contains("arm64") -> listOf("arm64-v8a", "arm64")
+      primaryAbi.contains("armeabi") -> listOf("armeabi-v7a", "armeabi")
+      primaryAbi.contains("x86_64") -> listOf("x86_64")
+      primaryAbi.contains("x86") -> listOf("x86")
+      else -> emptyList()
+    }
+
+  return variantFiltered.firstOrNull { asset ->
+    val name = asset.optString("name", "").lowercase()
+    abiTokens.any { token ->
+      if (token == "x86") name.contains("x86") && !name.contains("x86_64")
+      else name.contains(token)
+    }
+  }
+    ?: variantFiltered.firstOrNull { asset ->
+      asset.optString("name", "").lowercase().contains("universal")
+    }
+    ?: variantFiltered.firstOrNull()
+}
+
 /**
  * URLConnection defaults both connect and read timeouts to 0 (infinite) — opening a stream without
  * setting them can hang this Dispatchers.IO call indefinitely on a stalled request.
  */
 private fun openTimedStream(url: String): java.io.InputStream =
-  (URL(url).openConnection() as java.net.URLConnection)
+  (URL(url).openConnection() as HttpURLConnection)
     .apply {
       connectTimeout = 15_000
       readTimeout = 15_000
+      setRequestProperty("User-Agent", "Echo-Music")
+      if (url.contains("api.github.com")) {
+        setRequestProperty("Accept", "application/vnd.github+json")
+      }
     }
-    .getInputStream()
+    .inputStream
 
 /**
  * Looks up the release whose tag matches [currentVersion] (not necessarily the latest — the user
