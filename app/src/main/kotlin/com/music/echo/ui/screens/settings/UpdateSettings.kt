@@ -35,12 +35,15 @@ import echo.music.iad1tya.BuildConfig
 import echo.music.iad1tya.LocalPlayerAwareWindowInsets
 import echo.music.iad1tya.R
 import echo.music.iad1tya.echomusic.component.UpdateInfoDialog
+import echo.music.iad1tya.echomusic.updater.GITHUB_RELEASES_URL
 import echo.music.iad1tya.echomusic.updater.autoClearOldApks
+import echo.music.iad1tya.echomusic.updater.fetchLatestGitHubRelease
 import echo.music.iad1tya.echomusic.updater.getAutoUpdateCheckSetting
 import echo.music.iad1tya.echomusic.updater.getBetaUpdatesSetting
 import echo.music.iad1tya.echomusic.updater.getDownloadedApkCount
 import echo.music.iad1tya.echomusic.updater.getUpdateAvailableState
 import echo.music.iad1tya.echomusic.updater.getUpdateNotificationsSetting
+import echo.music.iad1tya.echomusic.updater.isReleaseNewerThanInstalled
 import echo.music.iad1tya.echomusic.updater.saveUpdateAvailableState
 import echo.music.iad1tya.ui.component.IconButton
 import echo.music.iad1tya.ui.component.Material3SettingsGroup
@@ -49,13 +52,6 @@ import echo.music.iad1tya.ui.utils.backToMain
 import echo.music.iad1tya.ui.utils.parseMarkdownToSections
 import echo.music.iad1tya.ui.utils.parseSimpleMarkdown
 import echo.music.iad1tya.ui.utils.safeOpenUri
-import java.net.HttpURLConnection
-import java.net.URL
-import org.json.JSONObject
-
-private const val GITHUB_RELEASES_URL = "https://github.com/EchoMusicApp/Echo-Music/releases"
-private const val GITHUB_LATEST_RELEASE_API_URL =
-  "https://api.github.com/repos/EchoMusicApp/Echo-Music/releases/latest"
 
 /**
  * Settings screen for managing app updates, checking for new releases, and displaying the latest
@@ -92,26 +88,10 @@ fun UpdateSettings(
 
     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
       try {
-        val connection =
-          (URL(GITHUB_LATEST_RELEASE_API_URL).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15_000
-            readTimeout = 15_000
-            setRequestProperty("Accept", "application/vnd.github+json")
-            setRequestProperty("User-Agent", "Echo-Music")
-          }
-        val json =
-          try {
-            connection.inputStream.bufferedReader().use { it.readText() }
-          } finally {
-            connection.disconnect()
-          }
-        val targetRelease = JSONObject(json)
+        val targetRelease = fetchLatestGitHubRelease() ?: return@withContext
         val tagName = targetRelease.optString("tag_name").trim()
         if (tagName.isNotEmpty()) {
-          val currentClean = BuildConfig.VERSION_NAME.removePrefix("b").removePrefix("v").trim()
-          val targetClean = tagName.removePrefix("b").removePrefix("v").trim()
-          val hasUpdate = currentClean != targetClean
+          val hasUpdate = isReleaseNewerThanInstalled(tagName)
           latestVersion = tagName
           isUpdateAvailable = hasUpdate
           saveUpdateAvailableState(context, hasUpdate)

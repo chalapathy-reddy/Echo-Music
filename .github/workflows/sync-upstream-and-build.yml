@@ -1,0 +1,348 @@
+name: Daily Upstream Sync & APK Release
+
+on:
+  schedule:
+    # Run daily at 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build and publish APK release even if upstream has no new commits"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-and-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/EchoMusicApp/Echo-Music.git
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+
+jobs:
+  sync-upstream:
+    name: Check & Sync Upstream Echo-Music
+    runs-on: ubuntu-latest
+    outputs:
+      synced: ${{ steps.sync.outputs.synced }}
+      should_build: ${{ steps.sync.outputs.should_build }}
+      upstream_short_sha: ${{ steps.sync.outputs.upstream_short_sha }}
+      upstream_full_sha: ${{ steps.sync.outputs.upstream_full_sha }}
+      commit_count: ${{ steps.sync.outputs.commit_count }}
+      changelog_b64: ${{ steps.sync.outputs.changelog_b64 }}
+
+    steps:
+      - name: Checkout Fork Repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch Upstream & Merge (Preserving Custom Updater)
+        id: sync
+        env:
+          FORCE_BUILD: ${{ inputs.force_build || false }}
+          HAS_SYNC_PAT: ${{ secrets.SYNC_PAT != '' }}
+        run: |
+          set -euo pipefail
+
+          # Protected custom update files that must never be overwritten by upstream
+          PROTECTED_FILES=(
+            "app/src/main/kotlin/com/music/echo/ui/screens/settings/UpdateSettings.kt"
+            "app/src/main/kotlin/com/music/echo/echomusic/updater/echomusicupdater.kt"
+            ".github/workflows/sync-upstream-and-build.yml"
+          )
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          UPSTREAM_REF="upstream/$UPSTREAM_BRANCH"
+          UPSTREAM_FULL_SHA="$(git rev-parse "$UPSTREAM_REF")"
+          UPSTREAM_SHORT_SHA="$(git rev-parse --short "$UPSTREAM_REF")"
+          COMMIT_COUNT="$(git rev-list --count "HEAD..$UPSTREAM_REF")"
+
+          echo "upstream_full_sha=$UPSTREAM_FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_short_sha=$UPSTREAM_SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "Already up to date with $UPSTREAM_REPO ($UPSTREAM_SHORT_SHA)."
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+
+            if [ "$FORCE_BUILD" = "true" ]; then
+              echo "Force build requested; proceeding to APK build and release."
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+              CHANGELOG_B64="$(printf '%s\n' "- Manual build triggered while already up to date with upstream (\`${UPSTREAM_SHORT_SHA}\`)." | base64 -w 0)"
+              echo "changelog_b64=$CHANGELOG_B64" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "changelog_b64=" >> "$GITHUB_OUTPUT"
+            fi
+
+            {
+              echo "### Upstream Sync Check"
+              echo "- **Status:** Already up to date with upstream \`${UPSTREAM_SHORT_SHA}\`"
+              echo "- **New upstream commits:** 0"
+              echo "- **Force build:** \`${FORCE_BUILD}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Capture synced upstream commits for release notes before merging
+          CHANGELOG="$(git log --no-merges --pretty=format:'- %s (`%h`)' -n 50 "HEAD..$UPSTREAM_REF")"
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="$(git log --pretty=format:'- %s (`%h`)' -n 20 "HEAD..$UPSTREAM_REF")"
+          fi
+          CHANGELOG_B64="$(printf '%s\n' "$CHANGELOG" | base64 -w 0)"
+          echo "changelog_b64=$CHANGELOG_B64" >> "$GITHUB_OUTPUT"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Merge upstream preferring upstream changes for general content conflicts
+          set +e
+          git merge --no-commit --no-ff -X theirs "$UPSTREAM_REF"
+          MERGE_EXIT=$?
+          set -e
+
+          # Resolve any remaining tree conflicts (e.g. modify/delete) in favor of upstream
+          if [ "$MERGE_EXIT" -ne 0 ]; then
+            while IFS= read -r conflict_file; do
+              [ -z "$conflict_file" ] && continue
+              if git cat-file -e "${UPSTREAM_REF}:${conflict_file}" 2>/dev/null; then
+                git checkout "$UPSTREAM_REF" -- "$conflict_file"
+                git add -- "$conflict_file"
+              else
+                git rm -f --ignore-unmatch -- "$conflict_file"
+              fi
+            done < <(git diff --name-only --diff-filter=U)
+          fi
+
+          # Default GITHUB_TOKEN cannot push changes inside .github/workflows/
+          # Preserve existing workflow directory unless SYNC_PAT is configured
+          if [ "$HAS_SYNC_PAT" != "true" ]; then
+            git rm -rf --ignore-unmatch -- .github/workflows
+            git checkout HEAD -- .github/workflows
+            git add -A -- .github/workflows
+          fi
+
+          # Restore protected custom update files (and this sync workflow) from fork HEAD
+          for protected in "${PROTECTED_FILES[@]}"; do
+            if git cat-file -e "HEAD:${protected}" 2>/dev/null; then
+              git checkout HEAD -- "$protected"
+              git add -- "$protected"
+            fi
+          done
+
+          # Final safety check: ensure no unmerged entries remain
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Unresolved merge conflicts remain after automated resolution."
+            git status --short
+            exit 1
+          fi
+
+          git commit --allow-empty -m "chore: sync upstream Echo-Music (${UPSTREAM_SHORT_SHA})"
+          git push origin "HEAD:${TARGET_BRANCH}"
+
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Upstream Sync Completed"
+            echo "- **Synced upstream commit:** \`${UPSTREAM_SHORT_SHA}\`"
+            echo "- **Upstream commits merged:** ${COMMIT_COUNT}"
+            echo "- **Protected files preserved:** \`UpdateSettings.kt\`, \`echomusicupdater.kt\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-and-release:
+    name: Build APK & Publish Release
+    needs: sync-upstream
+    if: ${{ needs.sync-upstream.outputs.should_build == 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Updated Fork
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          submodules: recursive
+
+      - name: Configure In-App Updater for Fork Releases
+        id: release_meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHORT_SHA: ${{ needs.sync-upstream.outputs.upstream_short_sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          FORK_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          DATE_COMPACT="$(date -u +%Y%m%d)"
+          DATE_PRETTY="$(date -u +%Y-%m-%d)"
+          BASE_TAG="sync-${DATE_COMPACT}-${UPSTREAM_SHORT_SHA}"
+          RELEASE_TAG="$BASE_TAG"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            RELEASE_TAG="${BASE_TAG}-run${RUN_NUMBER}"
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "date_pretty=$DATE_PRETTY" >> "$GITHUB_OUTPUT"
+
+          RELEASE_TAG="$RELEASE_TAG" FORK_REPO="$FORK_REPO" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          updater_path = Path("app/src/main/kotlin/com/music/echo/echomusic/updater/echomusicupdater.kt")
+          content = updater_path.read_text(encoding="utf-8")
+
+          fork_repo = os.environ["FORK_REPO"]
+          release_tag = os.environ["RELEASE_TAG"]
+
+          content, repo_count = re.subn(
+              r'const val UPDATE_GITHUB_REPO = "[^"]*"',
+              lambda _: f'const val UPDATE_GITHUB_REPO = "{fork_repo}"',
+              content,
+              count=1,
+          )
+          content, tag_count = re.subn(
+              r'const val INSTALLED_RELEASE_TAG = "[^"]*"',
+              lambda _: f'const val INSTALLED_RELEASE_TAG = "{release_tag}"',
+              content,
+              count=1,
+          )
+
+          if repo_count != 1 or tag_count != 1:
+              raise RuntimeError(
+                  f"Failed to configure updater constants (repo_count={repo_count}, tag_count={tag_count})"
+              )
+
+          updater_path.write_text(content, encoding="utf-8")
+          print(f"Configured in-app updater -> repo={fork_repo}, tag={release_tag}")
+          PY
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Setup Android NDK
+        run: |
+          set -euo pipefail
+          NDK_VERSION="$(sed -n 's/.*ndkVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          NDK_VERSION="${NDK_VERSION:-28.2.13676358}"
+          echo "Installing Android NDK: ${NDK_VERSION}"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}"
+
+      - name: Build APK (Auto-detect Release or Debug)
+        id: build
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ] && [ -n "${STORE_PASSWORD:-}" ]; then
+            echo "Keystore secrets detected. Building signed Universal GMS Release APK..."
+            trap 'rm -f keystore.jks' EXIT
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > keystore.jks
+            ./gradlew assembleUniversalGmsRelease
+            echo "build_variant=Universal GMS Release" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No complete keystore secrets found. Falling back to Universal FOSS Debug APK..."
+            mkdir -p "$HOME/.android"
+            if [ ! -f "$HOME/.android/debug.keystore" ]; then
+              keytool -genkeypair \
+                -keystore "$HOME/.android/debug.keystore" \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -dname "CN=Android Debug,O=Android,C=US" \
+                -keyalg RSA \
+                -validity 10000
+            fi
+            ./gradlew assembleUniversalFossDebug
+            echo "build_variant=Universal FOSS Debug" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORK_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+          DATE_PRETTY: ${{ steps.release_meta.outputs.date_pretty }}
+          UPSTREAM_SHORT_SHA: ${{ needs.sync-upstream.outputs.upstream_short_sha }}
+          UPSTREAM_FULL_SHA: ${{ needs.sync-upstream.outputs.upstream_full_sha }}
+          COMMIT_COUNT: ${{ needs.sync-upstream.outputs.commit_count }}
+          CHANGELOG_B64: ${{ needs.sync-upstream.outputs.changelog_b64 }}
+          BUILD_VARIANT: ${{ steps.build.outputs.build_variant }}
+          IS_RELEASE: ${{ steps.build.outputs.is_release }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t APKS < <(find app/build/outputs/apk -type f -name '*.apk' | sort)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::No APK files were produced in app/build/outputs/apk"
+            exit 1
+          fi
+
+          VERSION_NAME="$(sed -n 's/.*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)"
+          VERSION_LABEL="${VERSION_NAME:+v${VERSION_NAME} }"
+          RELEASE_TITLE="Echo Music ${VERSION_LABEL}(${DATE_PRETTY} - ${BUILD_VARIANT})"
+
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## Automated Upstream Sync Build"
+            echo ""
+            echo "- **Build Variant:** ${BUILD_VARIANT}"
+            echo "- **Upstream Commit:** [\`${UPSTREAM_SHORT_SHA}\`](https://github.com/EchoMusicApp/Echo-Music/commit/${UPSTREAM_FULL_SHA})"
+            echo "- **Upstream Commits Merged:** ${COMMIT_COUNT}"
+            echo "- **In-App Update Source:** [\`${FORK_REPO}\`](https://github.com/${FORK_REPO}/releases)"
+            echo "- **Protected Customizations Preserved:** \`UpdateSettings.kt\`, \`echomusicupdater.kt\`"
+            echo ""
+            if [ -n "${CHANGELOG_B64:-}" ]; then
+              echo "### Upstream Changes Included"
+              printf '%s' "$CHANGELOG_B64" | base64 -d
+              echo ""
+            fi
+          } > "$NOTES_FILE"
+
+          RELEASE_ARGS=(
+            "$RELEASE_TAG"
+            "${APKS[@]}"
+            --title "$RELEASE_TITLE"
+            --notes-file "$NOTES_FILE"
+            --target "$TARGET_BRANCH"
+          )
+
+          if [ "$IS_RELEASE" != "true" ]; then
+            RELEASE_ARGS+=(--prerelease)
+          fi
+
+          RELEASE_URL="$(gh release create "${RELEASE_ARGS[@]}")"
+          rm -f "$NOTES_FILE"
+
+          {
+            echo "### APK Release Published"
+            echo "- **Release:** [${RELEASE_TAG}](${RELEASE_URL})"
+            echo "- **Variant:** ${BUILD_VARIANT}"
+            echo "- **In-App Update Repo:** \`${FORK_REPO}\`"
+            echo "- **APKs attached:** ${#APKS[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"

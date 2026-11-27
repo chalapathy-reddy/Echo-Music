@@ -105,7 +105,45 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
-private const val GITHUB_RELEASES_URL = "https://github.com/EchoMusicApp/Echo-Music/releases"
+// Automatically set to your fork's GitHub repository (owner/repo) and release tag by the
+// sync-upstream-and-build GitHub Actions pipeline before compiling the APK.
+// For local builds, you may replace UPDATE_GITHUB_REPO with "<your-username>/<your-repo>".
+const val UPDATE_GITHUB_REPO = "EchoMusicApp/Echo-Music"
+const val INSTALLED_RELEASE_TAG = ""
+const val GITHUB_RELEASES_URL = "https://github.com/$UPDATE_GITHUB_REPO/releases"
+const val GITHUB_RELEASES_API_URL = "https://api.github.com/repos/$UPDATE_GITHUB_REPO/releases"
+
+fun isReleaseNewerThanInstalled(releaseTag: String): Boolean {
+  val cleanTag = releaseTag.trim()
+  if (cleanTag.isEmpty()) return false
+  if (INSTALLED_RELEASE_TAG.isNotBlank()) {
+    return cleanTag != INSTALLED_RELEASE_TAG.trim()
+  }
+  val currentClean = BuildConfig.VERSION_NAME.removePrefix("b").removePrefix("v").trim()
+  val targetClean = cleanTag.removePrefix("b").removePrefix("v").trim()
+  return currentClean != targetClean
+}
+
+fun fetchLatestGitHubRelease(): JSONObject? {
+  val releasesJson =
+    openTimedStream("$GITHUB_RELEASES_API_URL?per_page=10")
+      .bufferedReader()
+      .use { it.readText() }
+  val releases = JSONArray(releasesJson)
+  var firstNonDraft: JSONObject? = null
+  for (i in 0 until releases.length()) {
+    val release = releases.getJSONObject(i)
+    if (release.optBoolean("draft", false)) continue
+    if (firstNonDraft == null) {
+      firstNonDraft = release
+    }
+    val isPrerelease = release.optBoolean("prerelease", false)
+    if (BuildConfig.DEBUG || !isPrerelease) {
+      return release
+    }
+  }
+  return firstNonDraft
+}
 
 data class ChangelogSection(val title: String, val items: List<String>)
 
@@ -685,20 +723,30 @@ suspend fun checkForUpdate(
 ) {
   withContext(Dispatchers.IO) {
     try {
-      val json =
-        openTimedStream("https://api.github.com/repos/EchoMusicApp/Echo-Music/releases/latest")
-          .bufferedReader()
-          .use { it.readText() }
-      val targetRelease = JSONObject(json)
+      val targetRelease =
+        fetchLatestGitHubRelease()
+          ?: run {
+            withContext(Dispatchers.Main) {
+              onSuccess(
+                INSTALLED_RELEASE_TAG.ifBlank { BuildConfig.VERSION_NAME },
+                false,
+                emptyList(),
+                "",
+                "",
+                null,
+                null,
+                null,
+              )
+            }
+            return@withContext
+          }
 
-      val currentVersion = BuildConfig.VERSION_NAME
-      val targetTagName = targetRelease.getString("tag_name")
-      val currentClean = currentVersion.removePrefix("b").removePrefix("v").trim()
-      val targetClean = targetTagName.removePrefix("b").removePrefix("v").trim()
-      val shouldShow = currentClean != targetClean
+      val currentVersion = INSTALLED_RELEASE_TAG.ifBlank { BuildConfig.VERSION_NAME }
+      val targetTagName = targetRelease.optString("tag_name").trim()
+      val shouldShow = isReleaseNewerThanInstalled(targetTagName)
 
       if (shouldShow) {
-        val tagWithPrefix = targetRelease.getString("tag_name")
+        val tagWithPrefix = targetTagName
         val displayTag = tagWithPrefix
 
         val changelogList = mutableListOf<ChangelogSection>()
@@ -707,7 +755,7 @@ suspend fun checkForUpdate(
         try {
           val changelogJson =
             openTimedStream(
-                "https://github.com/EchoMusicApp/Echo-Music/releases/download/$tagWithPrefix/changelog.json",
+                "$GITHUB_RELEASES_URL/download/$tagWithPrefix/changelog.json",
               )
               .bufferedReader()
               .use { it.readText() }
@@ -797,18 +845,22 @@ data class WhatsNewInfo(
 )
 
 private fun selectBestApkAsset(assets: JSONArray): JSONObject? {
-  val candidates = mutableListOf<JSONObject>()
+  val allApks = mutableListOf<JSONObject>()
   for (j in 0 until assets.length()) {
     val asset = assets.getJSONObject(j)
     val assetName = asset.optString("name", "")
-    if (
-      assetName.endsWith(".apk", ignoreCase = true) &&
-        !assetName.lowercase().contains("debug")
-    ) {
-      candidates.add(asset)
+    if (assetName.endsWith(".apk", ignoreCase = true)) {
+      allApks.add(asset)
     }
   }
-  if (candidates.isEmpty()) return null
+  if (allApks.isEmpty()) return null
+
+  val candidates =
+    if (BuildConfig.DEBUG) {
+      allApks.filter { it.optString("name", "").lowercase().contains("debug") }.ifEmpty { allApks }
+    } else {
+      allApks.filter { !it.optString("name", "").lowercase().contains("debug") }.ifEmpty { allApks }
+    }
 
   val preferredVariant = if (BuildConfig.CAST_AVAILABLE) "gms" else "foss"
   val variantFiltered =
@@ -862,9 +914,10 @@ private fun openTimedStream(url: String): java.io.InputStream =
 suspend fun fetchChangelogForVersion(currentVersion: String): WhatsNewInfo? =
   withContext(Dispatchers.IO) {
     try {
-      val cleanCurrent = currentVersion.removePrefix("b").removePrefix("v").trim()
+      val targetVersion = INSTALLED_RELEASE_TAG.ifBlank { currentVersion }
+      val cleanCurrent = targetVersion.removePrefix("b").removePrefix("v").trim()
       val releasesJson =
-        openTimedStream("https://api.github.com/repos/EchoMusicApp/Echo-Music/releases")
+        openTimedStream(GITHUB_RELEASES_API_URL)
           .bufferedReader()
           .use { it.readText() }
       val releases = JSONArray(releasesJson)
@@ -872,8 +925,9 @@ suspend fun fetchChangelogForVersion(currentVersion: String): WhatsNewInfo? =
       var matchedRelease: JSONObject? = null
       for (i in 0 until releases.length()) {
         val release = releases.getJSONObject(i)
-        val tagClean = release.getString("tag_name").removePrefix("b").removePrefix("v").trim()
-        if (tagClean == cleanCurrent) {
+        val rawTag = release.optString("tag_name").trim()
+        val tagClean = rawTag.removePrefix("b").removePrefix("v").trim()
+        if (rawTag == targetVersion || tagClean == cleanCurrent) {
           matchedRelease = release
           break
         }
@@ -886,7 +940,7 @@ suspend fun fetchChangelogForVersion(currentVersion: String): WhatsNewInfo? =
       try {
         val changelogJson =
           openTimedStream(
-              "https://github.com/EchoMusicApp/Echo-Music/releases/download/$tag/changelog.json",
+              "$GITHUB_RELEASES_URL/download/$tag/changelog.json",
             )
             .bufferedReader()
             .use { it.readText() }
